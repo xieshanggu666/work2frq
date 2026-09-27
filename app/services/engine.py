@@ -107,9 +107,10 @@ class BunkerEngine:
         self.session.day += 1
         self._apply_production_and_consumption()
         self._apply_health_morale()
-        crisis = self._maybe_trigger_crisis()
         self._check_end()
-        return crisis
+        if self.session.status != "running":
+            return None  # 本日已结算（胜利/失败），不再派发新危机
+        return self._maybe_trigger_crisis()
 
     def _apply_production_and_consumption(self):
         pop = self.session.survivors
@@ -235,6 +236,8 @@ class BunkerEngine:
 
     def resolve_crisis(self, event_key, choice_key, target_id=None):
         """根据选择执行效果，返回结果描述。"""
+        if self.session.status != "running":
+            raise BunkerEngineError("游戏已结束，无法结算危机")
         event = next((e for e in CRISIS_POOL if e["key"] == event_key), None)
         if not event:
             raise BunkerEngineError("未知危机事件")
@@ -242,9 +245,16 @@ class BunkerEngine:
         if not choice:
             raise BunkerEngineError("未知决策选项")
 
+        # 归属校验：显式指定的目标必须属于当前档案且存活，
+        # 否则统一按无效目标拒绝结算（防止效果误落到全体居民）。
         target = None
-        if target_id:
-            target = next((r for r in self.session.residents if r.id == target_id), None)
+        if target_id is not None:
+            target = next(
+                (r for r in self.session.residents if r.id == target_id and r.alive),
+                None,
+            )
+            if target is None:
+                raise BunkerEngineError("目标居民不存在、已故或不属于当前档案")
 
         effects = choice.get("effects", {})
         detail_parts = []

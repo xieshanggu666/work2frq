@@ -161,3 +161,94 @@ def test_morale_recovery_toward_75(db):
     eng = BunkerEngine(db, gs, rand=FixedRand())
     eng._apply_health_morale()
     assert all(r.morale > 40 for r in gs.residents)
+
+
+class AlwaysCrisis:
+    """必触发危机的随机源（0.0 <= 0.45），choice 取第一个。"""
+
+    def random(self):
+        return 0.0
+
+    def choice(self, seq):
+        return seq[0]
+
+
+# ---- 危机结算目标校验（跨档案污染回归）----
+
+def test_resolve_crisis_rejects_foreign_resident(db):
+    """提交其他档案的居民编号：拒绝结算，当前档案数据不受污染。"""
+    gs1 = make_session(db)
+    gs2 = make_session(db)
+    foreign = gs2.residents[0]
+    eng = BunkerEngine(db, gs1, rand=FixedRand())
+    res_before = dict(gs1.resources)
+    state_before = [(r.health, r.morale) for r in gs1.residents]
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=foreign.id)
+    assert gs1.resources == res_before
+    assert [(r.health, r.morale) for r in gs1.residents] == state_before
+
+
+def test_resolve_crisis_rejects_unknown_resident(db):
+    """不存在的居民编号同样按无效目标拒绝。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=999999)
+
+
+def test_resolve_crisis_rejects_dead_resident(db):
+    """已故居民是无效目标，不应再被结算。"""
+    gs = make_session(db)
+    dead = gs.residents[0]
+    dead.alive = 0
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=dead.id)
+
+
+def test_resolve_crisis_hits_only_target(db):
+    """合法目标：健康/士气效果只落在该居民身上。"""
+    gs = make_session(db)
+    target = gs.residents[1]
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("sick", "quarantine", target_id=target.id)  # health -5
+    assert target.health == 85
+    others = [r for r in gs.residents if r.id != target.id]
+    assert all(r.health == 90 for r in others)
+
+
+def test_resolve_crisis_without_target_hits_all_alive(db):
+    """未指定目标时保持既有语义：效果作用于全体存活居民。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("mutiny", "double_ration")  # morale +20
+    assert all(r.morale == 100 for r in gs.residents)  # 80+20，封顶 100
+
+
+def test_resolve_crisis_rejected_after_game_end(db):
+    """结算边界：档案已结局后不允许再结算危机。"""
+    gs = make_session(db)
+    gs.status = "win"
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine")
+
+
+def test_no_crisis_issued_on_settlement_day(db):
+    """到达结局的当天不再派发新危机（结算后无可决议事件）。"""
+    gs = make_session(db, resources={FOOD: 9999, WATER: 9999, POWER: 9999, OXY: 9999})
+    gs.day = SURVIVAL_TARGET_DAY - 1
+    eng = BunkerEngine(db, gs, rand=AlwaysCrisis())
+    crisis = eng.advance_day()
+    assert gs.status == "win"
+    assert crisis is None
+
+
+def test_crisis_still_issued_mid_game(db):
+    """未结局时危机照常触发，且目标来自当前档案。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=AlwaysCrisis())
+    crisis = eng.advance_day()
+    assert crisis is not None
+    assert crisis["target_id"] in [r.id for r in gs.residents]
