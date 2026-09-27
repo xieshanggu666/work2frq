@@ -233,8 +233,30 @@ class BunkerEngine:
             ],
         }
 
+    def _ensure_running(self):
+        """结算边界：游戏结束后拒绝一切状态变更。"""
+        if self.session.status != "running":
+            raise BunkerEngineError("游戏已结束，无法执行该操作")
+
+    def _resolve_target(self, target_id):
+        """统一解析目标居民。
+
+        显式给出的目标必须归属当前档案且存活；跨档案编号、不存在或已故的
+        目标一律报错，绝不静默回退为全体，避免跨档案数据污染。
+        未提供目标（target_id 为 None）时返回 None，由调用方按全体处理。
+        """
+        if target_id is None:
+            return None
+        target = next((r for r in self.session.residents if r.id == target_id), None)
+        if target is None:
+            raise BunkerEngineError("目标居民不存在或不属于当前档案")
+        if not target.alive:
+            raise BunkerEngineError("目标居民已故，无法作为效果目标")
+        return target
+
     def resolve_crisis(self, event_key, choice_key, target_id=None):
         """根据选择执行效果，返回结果描述。"""
+        self._ensure_running()
         event = next((e for e in CRISIS_POOL if e["key"] == event_key), None)
         if not event:
             raise BunkerEngineError("未知危机事件")
@@ -242,9 +264,8 @@ class BunkerEngine:
         if not choice:
             raise BunkerEngineError("未知决策选项")
 
-        target = None
-        if target_id:
-            target = next((r for r in self.session.residents if r.id == target_id), None)
+        # 在应用任何效果前完成目标校验，保证失败时档案状态不发生部分变更
+        target = self._resolve_target(target_id)
 
         effects = choice.get("effects", {})
         detail_parts = []
@@ -253,16 +274,16 @@ class BunkerEngine:
         for k, v in effects.get("resources", {}).items():
             self._add_resource(k, v)
             detail_parts.append(f"{RESOURCE_ZH.get(k,k)} {v:+.0f}")
-        # 健康/士气效果（作用于目标或全体）
+        # 健康/士气效果：显式目标只作用于本人，未提供目标才作用于全体存活者
         if "health" in effects:
             val = effects["health"]
-            pool = [target] if target else [r for r in self.session.residents if r.alive]
+            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
             for r in pool:
                 r.health = _clamp(r.health + val)
             detail_parts.append(f"健康 {val:+.0f}")
         if "morale" in effects:
             val = effects["morale"]
-            pool = [target] if target else [r for r in self.session.residents if r.alive]
+            pool = [target] if target is not None else [r for r in self.session.residents if r.alive]
             for r in pool:
                 r.morale = _clamp(r.morale + val)
             detail_parts.append(f"士气 {val:+.0f}")
@@ -292,6 +313,7 @@ class BunkerEngine:
 
     # ---- 扩建 ----
     def build_facility(self, category):
+        self._ensure_running()
         cost = FACILITY_COST[1]
         if not self._can_afford(cost):
             raise BunkerEngineError("资源不足，无法建造")
@@ -311,6 +333,7 @@ class BunkerEngine:
         return f
 
     def upgrade_facility(self, facility_id):
+        self._ensure_running()
         f = next((x for x in self.session.facilities if x.id == facility_id), None)
         if not f:
             raise BunkerEngineError("设施不存在")
@@ -331,6 +354,7 @@ class BunkerEngine:
 
     # ---- 任务分配（重分配岗位）----
     def set_job(self, resident_id, job):
+        self._ensure_running()
         if job not in JOB_EFFICIENCY:
             raise BunkerEngineError("未知岗位")
         r = next((x for x in self.session.residents if x.id == resident_id), None)

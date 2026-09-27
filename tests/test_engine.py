@@ -161,3 +161,81 @@ def test_morale_recovery_toward_75(db):
     eng = BunkerEngine(db, gs, rand=FixedRand())
     eng._apply_health_morale()
     assert all(r.morale > 40 for r in gs.residents)
+
+
+# ---- 目标归属校验：防止跨档案数据污染 ----
+
+def test_foreign_archive_target_rejected(db):
+    """提交其他档案的居民编号：报错且本档案居民/资源均不受影响。"""
+    gs = make_session(db)
+    other = make_session(db)
+    foreign_id = other.residents[0].id
+
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    health_before = [r.health for r in gs.residents]
+    food_before = gs.resources[FOOD]
+    # 疫病·隔离：扣食物且对目标造成健康 -5
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=foreign_id)
+    # 本档案无人受到伤害
+    assert [r.health for r in gs.residents] == health_before
+    # 目标校验在资源结算之前，资源也不应被扣减
+    assert gs.resources[FOOD] == food_before
+
+
+def test_nonexistent_target_rejected(db):
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    missing_id = max(r.id for r in gs.residents) + 9999
+    health_before = [r.health for r in gs.residents]
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=missing_id)
+    assert [r.health for r in gs.residents] == health_before
+
+
+def test_dead_target_rejected(db):
+    gs = make_session(db)
+    dead = gs.residents[0]
+    dead.alive = 0
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=dead.id)
+
+
+def test_valid_target_only_affects_that_resident(db):
+    """有效本档案目标：健康效果只作用于其本人，不波及其他居民。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    target = gs.residents[1]
+    others = [r for r in gs.residents if r.id != target.id]
+    others_before = [r.health for r in others]
+    # 盗匪·武装抵抗：健康 -8
+    eng.resolve_crisis("raid", "defend", target_id=target.id)
+    assert target.health == 82  # 90 - 8
+    assert [r.health for r in others] == others_before
+
+
+def test_no_target_applies_to_all_alive(db):
+    """未提供目标时，士气类全体效果仍按原语义作用于全体存活者。"""
+    gs = make_session(db)
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    eng.resolve_crisis("mutiny", "double_ration")  # 士气 +20
+    assert all(r.morale == 100 for r in gs.residents if r.alive)
+
+
+# ---- 结算边界：已结束档案拒绝一切状态变更 ----
+
+def test_actions_rejected_after_game_end(db):
+    gs = make_session(db)
+    gs.status = "over"
+    eng = BunkerEngine(db, gs, rand=FixedRand())
+    rid = gs.residents[0].id
+    fid = gs.facilities[0].id
+    with pytest.raises(BunkerEngineError):
+        eng.resolve_crisis("sick", "quarantine", target_id=rid)
+    with pytest.raises(BunkerEngineError):
+        eng.build_facility("med")
+    with pytest.raises(BunkerEngineError):
+        eng.upgrade_facility(fid)
+    with pytest.raises(BunkerEngineError):
+        eng.set_job(rid, "farmer")
